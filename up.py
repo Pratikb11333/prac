@@ -2,10 +2,10 @@ import os
 import shutil
 import uuid
 import pandas as pd
-from typing import List, Optional
-from fastapi import UploadFile, HTTPException, File, Form
+from typing import List, Optional, Dict, Any
+from fastapi import UploadFile, HTTPException
 from pypdf import PdfReader
-from docx import Document # New import for Word Docs
+from docx import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
@@ -56,9 +56,6 @@ def load_pdf(file_path: str):
     return splitter.split_text(text)
 
 def load_word(file_path: str):
-    """
-    Reads Word (.docx) files.
-    """
     try:
         doc = Document(file_path)
         text = "\n".join([para.text for para in doc.paragraphs])
@@ -87,7 +84,7 @@ def index_chunks(chunks, doc_id: str, source_filename: str):
             "content": chunk,
             "vector": embed_text(chunk),
             "doc_id": doc_id,
-            "source": source_filename # Helps LLM cite the source
+            "source": source_filename
         })
     search_client.upload_documents(documents)
 
@@ -104,14 +101,9 @@ def retrieve_context(query: str, k: int = 5):
     )
     return " ".join([f"[Source: {doc.get('source', 'unknown')}]: {doc['content']}" for doc in results])
 
-# --- API ENDPOINTS ---
+# --- CORE LOGIC FUNCTIONS ---
 
-@app.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    user_id: str = Form(None), # If provided, we add to this user's session
-    is_transcript: bool = Form(True) # True = Initial Base, False = Extension Material
-):
+async def handle_document_upload(file: UploadFile, user_id: Optional[str], is_transcript: bool) -> Dict[str, Any]:
     os.makedirs("temp", exist_ok=True)
     file_path = f"temp/{uuid.uuid4()}_{file.filename}"
     
@@ -140,16 +132,18 @@ async def upload_document(
     elif filename_lower.endswith((".xlsx", ".xls")):
         chunks = load_excel(file_path)
     
+    file_type = "transcript" if is_transcript else "extension"
+    
     if chunks:
         index_chunks(chunks, doc_id, file.filename)
         
         # Track file in session
-        file_type = "transcript" if is_transcript else "extension"
-        chat_sessions[user_id]["files"].append({
-            "filename": file.filename,
-            "doc_id": doc_id,
-            "type": file_type
-        })
+        if user_id in chat_sessions:
+            chat_sessions[user_id]["files"].append({
+                "filename": file.filename,
+                "doc_id": doc_id,
+                "type": file_type
+            })
 
     return {
         "status": "success",
@@ -158,14 +152,13 @@ async def upload_document(
         "message": f"Processed {file.filename}. You can now ask to {'generate' if is_transcript else 'update'} the precis."
     }
 
-@app.post("/chat")
-def generate_answer(user_id: str, query: str):
+def handle_chat_generation(user_id: str, query: str) -> Dict[str, Any]:
     if user_id not in chat_sessions:
         return {"error": "Session not found."}
 
     session = chat_sessions[user_id]
     
-    # 1. Retrieve Context (searches across ALL uploaded files: PDF, Doc, Excel)
+    # 1. Retrieve Context
     context = retrieve_context(query)
     
     # 2. Construct Prompt
@@ -227,3 +220,44 @@ def generate_answer(user_id: str, query: str):
         "current_precis": session.get("current_precis"),
         "has_charts": "chart" in query.lower()
     }
+
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Optional
+
+# Import the logic functions from upload.py
+from upload import handle_document_upload, handle_chat_generation
+
+app = FastAPI()
+
+@app.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: str = Form(None), 
+    is_transcript: bool = Form(True) 
+):
+    """
+    Endpoint to handle file uploads (PDF, DOCX, XLSX).
+    Delegates logic to upload.py
+    """
+    try:
+        result = await handle_document_upload(file, user_id, is_transcript)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat")
+def generate_answer(user_id: str, query: str):
+    """
+    Endpoint to handle chat interactions and precis generation.
+    Delegates logic to upload.py
+    """
+    try:
+        result = handle_chat_generation(user_id, query)
+        if "error" in result:
+             raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
